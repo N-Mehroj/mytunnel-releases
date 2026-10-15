@@ -1,0 +1,159 @@
+# Builds the MyTunnel desktop app for Windows, Linux and macOS from the private
+# source repo N-Mehroj/mytunnel and publishes the installers as a release here.
+# It runs in this public repo because Actions minutes are free for public repos.
+#
+# Actions → Release → Run workflow:
+#   tag = v1.3.0  → builds that tag of the source repo and publishes release v1.3.0
+#   tag empty     → only builds the "ref" branch (installers kept as run artifacts)
+#
+# Requires the SOURCE_DEPLOY_KEY secret: private half of a read-only deploy key
+# added to N-Mehroj/mytunnel.
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag in the source repo (e.g. v1.3.0); empty = build only"
+        required: false
+        default: ""
+      ref:
+        description: "Branch to build when tag is empty"
+        required: false
+        default: master
+
+permissions:
+  contents: read
+
+env:
+  SOURCE_REPO: N-Mehroj/mytunnel
+  SOURCE_REF: ${{ inputs.tag || inputs.ref }}
+
+jobs:
+  build:
+    name: Build (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows
+            runner: windows-latest
+            os: win
+            archs: x64
+            builder: --win
+          - name: Linux
+            runner: ubuntu-latest
+            os: linux
+            archs: x64
+            builder: --linux
+          - name: macOS
+            runner: macos-latest
+            os: mac
+            archs: x64 arm64
+            builder: --mac
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.SOURCE_REF }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+
+      - uses: pnpm/action-setup@v4 # version comes from "packageManager" in package.json
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: agent/go.mod
+          cache-dependency-path: agent/go.sum
+
+      - name: Set version from tag
+        if: inputs.tag != ''
+        env:
+          TAG: ${{ inputs.tag }}
+        run: npm pkg set version="${TAG#v}"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build agent
+        run: VERSION="$(node -p 'require("./package.json").version')" scripts/build-agent.sh ${{ matrix.os }} ${{ matrix.archs }}
+
+      - name: Build app
+        run: pnpm build
+
+      - name: Package installers
+        run: pnpm exec electron-builder ${{ matrix.builder }} --publish never
+        env:
+          # No code-signing certificates yet: build unsigned installers.
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installers-${{ matrix.os }}
+          if-no-files-found: error
+          path: |
+            release/*.exe
+            release/*.dmg
+            release/*.AppImage
+            release/*.deb
+            release/*.blockmap
+            release/latest*.yml
+
+  release:
+    name: Publish release
+    needs: build
+    if: inputs.tag != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ inputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.tag }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          fetch-depth: 0 # full history for the changelog
+
+      - name: Release notes
+        run: |
+          prev=$(git describe --tags --abbrev=0 "$TAG^" 2>/dev/null || true)
+          range=${prev:+$prev..}$TAG
+          {
+            echo "## O'zgarishlar"
+            echo
+            git log --no-merges --pretty='- %s' "$range"
+            echo
+            echo "O'rnatish bo'yicha yo'riqnoma: [README](https://github.com/$GITHUB_REPOSITORY#readme)"
+          } > "$RUNNER_TEMP/notes.md"
+          cat "$RUNNER_TEMP/notes.md"
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: installers-*
+          path: ${{ runner.temp }}/release
+          merge-multiple: true
+
+      - name: List files
+        run: ls -lh "$RUNNER_TEMP/release"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          repository: ${{ github.repository }}
+          token: ${{ github.token }}
+          target_commitish: ${{ github.sha }}
+          tag_name: ${{ inputs.tag }}
+          name: MyTunnel ${{ inputs.tag }}
+          body_path: ${{ runner.temp }}/notes.md
+          files: ${{ runner.temp }}/release/*
+          prerelease: ${{ contains(inputs.tag, '-') }}
+          make_latest: ${{ !contains(inputs.tag, '-') }}
